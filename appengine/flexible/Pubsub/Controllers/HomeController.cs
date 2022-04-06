@@ -18,9 +18,13 @@ using Google.Cloud.PubSub.V1;
 using Google.Protobuf;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Options;
+using Google.Apis.Auth;
 using Pubsub.ViewModels;
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using System.Collections.Concurrent;
 
 namespace Pubsub.Controllers
 {
@@ -31,6 +35,10 @@ namespace Pubsub.Controllers
         static object s_lock = new object();
         // Keep the received messages in a list.
         static List<string> s_receivedMessages = new List<string>();
+        // Keep a cache of already seen jwt tokens.
+        private static readonly ConcurrentDictionary<string, bool> s_tokens = new ConcurrentDictionary<string, bool>();
+        // Keep a cache of already seen claims.
+        private static readonly ConcurrentDictionary<PubSubPayload, bool> s_claims = new ConcurrentDictionary<PubSubPayload, bool>();
         readonly PublisherClient _publisher;
 
         public HomeController(IOptions<PubsubOptions> options,
@@ -90,6 +98,46 @@ namespace Pubsub.Controllers
         }
         // [END gae_flex_pubsub_push]
 
+        // [START gaeflex_net_pubsub_auth_push]
+        /// <summary>
+        /// Handle authenticated push request coming from pubsub.
+        /// </summary>
+        [HttpPost]
+        [Route("/AuthPush")]
+        public async Task<IActionResult> AuthPushAsync([FromBody] PushBody body, [FromQuery] string token)
+        {
+            string bearerToken = HttpContext.Request.Headers["Authorization"];
+            string authToken = bearerToken.Split(" ")[1];
+            s_tokens[authToken] = true;
+    
+            // Verify and decode the JWT.
+            // Note: For high volume push requests, it would save some network
+            // overhead if you verify the tokens offline by decoding them using
+            // Google's Public Cert; caching already seen tokens works best when
+            // a large volume of messages have prompted a single push server to
+            // handle them, in which case they would all share the same token for
+            // a limited time window.
+            var claim = await JsonWebSignature.VerifySignedTokenAsync<PubSubPayload>(authToken);
+
+            // IMPORTANT: you should validate claim details not covered
+            // by signature and audience verification above, including:
+            //   - Ensure that `claim.email` is equal to the expected service
+            //     account set up in the push subscription settings.
+            //   - Ensure that `claim.email_verified` is set to true.
+            s_claims[claim] = true;
+
+            string verificationToken = token ?? body.message.attributes["token"];
+            if (verificationToken != _options.VerificationToken)
+            {
+                return new BadRequestResult();
+            }
+            var messageBytes = Convert.FromBase64String(body.message.data);
+            string message = System.Text.Encoding.UTF8.GetString(messageBytes);
+            lock (s_lock) s_receivedMessages.Add(message);
+            return new OkResult();
+        }
+        // [END gaeflex_net_pubsub_auth_push]
+
         public IActionResult Error()
         {
             return View();
@@ -111,6 +159,16 @@ namespace Pubsub.Controllers
         public string data { get; set; }
         public string message_id { get; set; }
         public string publish_time { get; set; }
+    }
+    /// <summary>
+    /// Extended JWT payload to match the pubsub payload format
+    /// </summary>
+    public class PubSubPayload: JsonWebSignature.Payload
+    {
+        [JsonProperty("email")]
+        public string Email { get; set; }
+        [JsonProperty("email_verified")]
+        public string EmailVerified { get; set; }
     }
 
 }
